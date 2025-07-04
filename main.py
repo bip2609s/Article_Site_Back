@@ -17,12 +17,15 @@ import uvicorn
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 import os
+import logging
 from fastapi.responses import JSONResponse
 import asyncpg
-from asyncpg import Record
+import asyncio
 from asyncpg.pool import Pool
 from typing import Optional, List
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -53,6 +56,34 @@ REFRESH_TOKEN_EXPIRE_DAYS = 7
 # Хеширование паролей
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
+db_pool: Optional[Pool] = None
+
+# Улучшенная функция получения пула с обработкой ошибок
+async def get_db(retries=3, delay=2) -> Pool:
+    global db_pool
+    if db_pool and not db_pool._closed:
+        return db_pool
+
+    logger.info("Создаю новый пул подключений к БД...")
+    for attempt in range(1, retries + 1):
+        try:
+            pool = await asyncpg.create_pool(
+                DATABASE_URL,
+                min_size=5,
+                max_size=20,
+                command_timeout=60,
+                timeout=60,
+                max_inactive_connection_lifetime=300,
+            )
+            db_pool = pool
+            logger.info("Успешно создан пул подключений к БД")
+            return pool
+        except Exception as e:
+            logger.error(f"Ошибка подключения к БД (попытка {attempt}/{retries}): {e}")
+            if attempt < retries:
+                logger.info(f"Повторная попытка через {delay} секунд...")
+                await asyncio.sleep(delay)
+    raise HTTPException(status_code=500, detail="Не удалось подключиться к базе данных")
 
 # Модель пользователя в БД (пример)
 class User(BaseModel):
@@ -111,14 +142,86 @@ class RecaptchaRequest(BaseModel):
     token: str
 
 
+class CommentCreate(BaseModel):
+    article_id: int
+    content: str
+
+
+class CommentResponse(BaseModel):
+    id: int
+    article_id: int
+    user_id: int
+    content: str
+    created_at: datetime
+    username: str  # Для отображения имени пользователя
+
+
+class CommentDeleteResponse(BaseModel):
+    success: bool
+    message: str
+
+
 async def get_db_pool() -> Pool:
     return await asyncpg.create_pool(DATABASE_URL)
 
 
-async def create_tables():
-    pool = await get_db_pool()
-    async with pool.acquire() as connection:
-        await connection.execute(
+# async def create_tables():
+#     pool = await get_db_pool()
+#     async with pool.acquire() as connection:
+#         await connection.execute(
+#             """
+#             CREATE TABLE IF NOT EXISTS users (
+#                 id SERIAL PRIMARY KEY,
+#                 username VARCHAR(50) UNIQUE NOT NULL,
+#                 email VARCHAR(100) UNIQUE NOT NULL,
+#                 hashed_password TEXT NOT NULL
+#             )
+#         """
+#         )
+
+#         await connection.execute(
+#             """
+#             CREATE TABLE IF NOT EXISTS refresh_tokens (
+#                 user_id INTEGER REFERENCES users(id),
+#                 token TEXT UNIQUE NOT NULL,
+#                 expires_at TIMESTAMP NOT NULL
+#             )
+#         """
+#         )
+
+#         await connection.execute(
+#             """
+#             CREATE TABLE IF NOT EXISTS articles (
+#                 id SERIAL PRIMARY KEY,
+#                 author VARCHAR(50) NOT NULL,
+#                 title VARCHAR(255) NOT NULL,
+#                 content TEXT NOT NULL
+#             )
+#         """
+#         )
+
+#         await connection.execute(
+#             """
+#             CREATE TABLE IF NOT EXISTS comments (
+#                 id SERIAL PRIMARY KEY,
+#                 article_id INTEGER REFERENCES articles(id) ON DELETE CASCADE,
+#                 user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+#                 content TEXT NOT NULL,
+#                 created_at TIMESTAMP DEFAULT NOW()
+#             )
+#         """
+#         )
+
+
+@app.on_event("startup")
+async def startup():
+    """
+    Создание таблиц при старте сервера
+    """
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        # Таблицы
+        await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
                 id SERIAL PRIMARY KEY,
@@ -128,8 +231,7 @@ async def create_tables():
             )
         """
         )
-
-        await connection.execute(
+        await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS refresh_tokens (
                 user_id INTEGER REFERENCES users(id),
@@ -138,8 +240,7 @@ async def create_tables():
             )
         """
         )
-
-        await connection.execute(
+        await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS articles (
                 id SERIAL PRIMARY KEY,
@@ -149,11 +250,18 @@ async def create_tables():
             )
         """
         )
-
-
-@app.on_event("startup")
-async def startup():
-    await create_tables()
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS comments (
+                id SERIAL PRIMARY KEY,
+                article_id INTEGER REFERENCES articles(id) ON DELETE CASCADE,
+                user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                content TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """
+        )
+    logger.info("Все таблицы проверены/созданы")
 
 
 @router.post("/verify-recaptcha")
@@ -252,7 +360,8 @@ async def signup(user: UserCreate, response: Response):
             INSERT INTO refresh_tokens (user_id, token, expires_at)
             VALUES ($1, $2, NOW() + INTERVAL '7 days')
             """,
-            user_id, refresh_token
+            user_id,
+            refresh_token,
         )
 
     response.set_cookie(
@@ -297,7 +406,8 @@ async def login(user: UserLogin, response: Response):
             INSERT INTO refresh_tokens (user_id, token, expires_at)
             VALUES ((SELECT id FROM users WHERE email = $1), $2, NOW() + INTERVAL '7 days')
             """,
-            user.email, refresh_token
+            user.email,
+            refresh_token,
         )
 
     response.set_cookie(
@@ -463,22 +573,23 @@ async def search_articles(
     skip: int = 0,
     limit: int = 10,
 ):
-    pool = await get_db_pool()
-
-    async with pool.acquire() as conn:
-        results = await conn.fetch(
-            """
-            SELECT * FROM articles
-            WHERE title ILIKE $1
-            OFFSET $2 LIMIT $3
-            """,
-            f"%{query}%",
-            skip,
-            limit,
-        )
-
-    return [dict(record) for record in results]
-
+    pool = await get_db()
+    try:
+        async with pool.acquire() as conn:
+            results = await conn.fetch(
+                """
+                SELECT * FROM articles
+                WHERE title ILIKE $1
+                OFFSET $2 LIMIT $3
+                """,
+                f"%{query}%",
+                skip,
+                limit,
+            )
+            return [dict(record) for record in results]
+    except asyncpg.exceptions.PostgresError as e:
+        logger.error(f"Ошибка поиска статей: {e}")
+        raise HTTPException(status_code=500, detail="Ошибка поиска статей")
 
 @app.get("/api/articles/{article_id}", response_model=ArticleResponse)
 async def get_article(article_id: int = Path(..., gt=0, title="ID статьи")):
@@ -519,6 +630,120 @@ async def addarticle(article: WriteArticle):
         )
 
     return {"success": True}
+
+
+@app.post("/api/comments")
+async def add_comment(comment: CommentCreate, request: Request, response: Response):
+    pool = await get_db()
+    access_token = request.cookies.get("access_token")
+    if not access_token:
+        raise HTTPException(status_code=401, detail="Требуется авторизация")
+
+    try:
+        payload = jwt.decode(access_token, SECRET_KEY, algorithms=[ALGORITHM])
+        email = payload.get("sub")
+        async with pool.acquire() as conn:
+            # Получаем пользователя
+            user = await conn.fetchrow("SELECT id, username FROM users WHERE email = $1", email)
+            if not user:
+                raise HTTPException(status_code=404, detail="Пользователь не найден")
+
+            # Проверяем существование статьи
+            article = await conn.fetchrow("SELECT id FROM articles WHERE id = $1", comment.article_id)
+            if not article:
+                raise HTTPException(status_code=404, detail="Статья не найдена")
+
+            # Добавляем комментарий
+            comment_record = await conn.fetchrow(
+                """
+                INSERT INTO comments (article_id, user_id, content)
+                VALUES ($1, $2, $3)
+                RETURNING id, content, created_at
+                """,
+                comment.article_id,
+                user["id"],
+                comment.content,
+            )
+
+            return {
+                "id": comment_record["id"],
+                "content": comment_record["content"],
+                "created_at": comment_record["created_at"].isoformat(),
+                "username": user["username"],
+            }
+
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Невалидный токен")
+    except asyncpg.exceptions.PostgresError as e:
+        logger.error(f"Ошибка добавления комментария: {e}")
+        raise HTTPException(status_code=500, detail="Ошибка добавления комментария")
+
+
+@app.get("/api/comments/{article_id}")
+async def get_comments(article_id: int = Path(..., gt=0)):
+    pool = await get_db()
+    try:
+        async with pool.acquire() as conn:
+            comments = await conn.fetch(
+                """
+                SELECT c.id, c.content, c.created_at, u.username 
+                FROM comments c
+                JOIN users u ON c.user_id = u.id
+                WHERE c.article_id = $1
+                ORDER BY c.created_at DESC
+                """,
+                article_id,
+            )
+            return [
+                {
+                    "id": comment["id"],
+                    "content": comment["content"],
+                    "created_at": comment["created_at"].isoformat(),
+                    "username": comment["username"],
+                }
+                for comment in comments
+            ]
+    except asyncpg.exceptions.PostgresError as e:
+        logger.error(f"Ошибка загрузки комментариев: {e}")
+        raise HTTPException(status_code=500, detail="Ошибка загрузки комментариев")
+
+
+@app.delete("/api/comments/{comment_id}", response_model=CommentDeleteResponse)
+async def delete_comment(
+    comment_id: int = Path(..., gt=0),
+    request: Request = None,
+    response: Response = None,
+):
+    pool = await get_db()
+    access_token = request.cookies.get("access_token")
+    if not access_token:
+        raise HTTPException(status_code=401, detail="Требуется авторизация")
+
+    try:
+        payload = jwt.decode(access_token, SECRET_KEY, algorithms=[ALGORITHM])
+        email = payload.get("sub")
+        async with pool.acquire() as conn:
+            # Получаем пользователя
+            user = await conn.fetchrow("SELECT id FROM users WHERE email = $1", email)
+            if not user:
+                raise HTTPException(status_code=404, detail="Пользователь не найден")
+
+            # Проверяем существование комментария
+            comment = await conn.fetchrow("SELECT user_id FROM comments WHERE id = $1", comment_id)
+            if not comment:
+                raise HTTPException(status_code=404, detail="Комментарий не найден")
+
+            if comment["user_id"] != user["id"]:
+                raise HTTPException(status_code=403, detail="Нет прав для удаления")
+
+            # Удаляем комментарий
+            await conn.execute("DELETE FROM comments WHERE id = $1", comment_id)
+            return {"success": True, "message": "Комментарий удален"}
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Невалидный токен")
+    except asyncpg.exceptions.PostgresError as e:
+        logger.error(f"Ошибка удаления комментария: {e}")
+        raise HTTPException(status_code=500, detail="Ошибка удаления комментария")
 
 
 if __name__ == "__main__":

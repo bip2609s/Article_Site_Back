@@ -7,6 +7,9 @@ from fastapi import (
     Request,
     Response,
     APIRouter,
+    UploadFile,
+    File,
+    Form,
 )
 from pydantic import BaseModel
 from passlib.context import CryptContext
@@ -26,6 +29,8 @@ from slowapi import Limiter
 from slowapi.util import get_remote_address
 from contextlib import asynccontextmanager
 import asyncio
+import uuid
+from fastapi.staticfiles import StaticFiles
 
 # Настройка логирования
 logging.basicConfig(
@@ -82,7 +87,7 @@ async def lifespan(app: FastAPI):
             await db_pool.close()
             logger.info("Пул подключений к БД закрыт")
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(lifespan=lifespan, max_request_size=100 * 1024 * 1024)  # 100 MB
 
 # Настройки лимитера
 limiter = Limiter(key_func=get_remote_address, default_limits=["10 per minute"])
@@ -95,6 +100,13 @@ RECAPTCHA_SECRET_KEY = os.getenv("RECAPTCHA_SECRET_KEY")
 
 router = APIRouter()
 
+# Настройки для загрузки изображений
+UPLOAD_DIR = "static/uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# Подключение статики
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
 # Middleware
 app.add_middleware(
     CORSMiddleware,
@@ -103,6 +115,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Допустимые типы изображений
+ALLOWED_IMAGE_TYPES = [
+    "image/jpeg", 
+    "image/png", 
+    "image/gif", 
+    "image/webp",
+    "image/svg+xml"
+]
 
 # Middleware для обработки ошибок БД
 @app.middleware("http")
@@ -182,7 +203,21 @@ async def create_tables():
                     )
                 """)
                 
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS article_images (
+                        id SERIAL PRIMARY KEY,
+                        article_id INTEGER NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
+                        image_path TEXT NOT NULL,
+                        created_at TIMESTAMP DEFAULT NOW()
+                    )
+                """)
+                
                 # Создаем индексы
+                await conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_article_images_article_id 
+                    ON article_images(article_id)
+                """)
+                
                 await conn.execute("""
                     CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)
                 """)
@@ -616,53 +651,147 @@ async def user_wants_to_exit(request: Request, response: Response):
 @limiter.limit("30 per minute")
 async def search_articles(
     request: Request, 
-    query: str = Query(..., min_length=1, max_length=100),
+    query: Optional[str] = Query(None, min_length=1, max_length=100),
+    author: Optional[str] = Query(None, min_length=1, max_length=50),
     skip: int = 0,
     limit: int = 10,
 ):
-    """Поиск статей по заголовку"""
+    """Поиск статей по заголовку или автору"""
     try:
-        results = await fetch_all(
-            "SELECT id, title, content FROM articles WHERE title ILIKE $1 OFFSET $2 LIMIT $3",
-            f"%{query}%",
-            skip,
-            limit,
-        )
+        conditions = []
+        params = []
         
-        return [
-            {
-                "id": record["id"],
-                "title": record["title"],
-                "content": record["content"][:200] + "..." if len(record["content"]) > 200 else record["content"]
-            }
-            for record in results
-        ]
+        if query:
+            conditions.append("a.title ILIKE ${}".format(len(params)+1))
+            params.append(f"%{query}%")
+            
+        if author:
+            conditions.append("a.author = ${}".format(len(params)+1))
+            params.append(author)
+            
+        if not conditions:
+            raise HTTPException(
+                status_code=400, 
+                detail="Требуется параметр query или author"
+            )
+            
+        where_clause = " AND ".join(conditions)
+        params.extend([skip, limit])
+
+        results = await fetch_all(
+            f"""
+            SELECT 
+                a.id, 
+                a.author,
+                a.title, 
+                a.content,
+                COALESCE(
+                    (SELECT json_agg(json_build_object('id', ai.id, 'path', ai.image_path))
+                    FROM article_images ai
+                    WHERE ai.article_id = a.id
+                    ),
+                    '[]'::json
+                ) AS images
+            FROM articles a
+            WHERE {where_clause}
+            OFFSET ${len(params)-1} LIMIT ${len(params)}
+            """,
+            *params,
+        )
+        return [dict(record) for record in results]
     except Exception as e:
         logger.error(f"Ошибка поиска статей: {e}")
-        raise HTTPException(status_code=500, detail="Ошибка выполнения поискового запроса")
+        raise HTTPException(status_code=500, detail="Ошибка выполнения запроса")
 
 @app.get("/api/articles/{article_id}")
 @limiter.limit("30 per minute")
 async def get_article(request: Request, article_id: int = Path(..., gt=0)):
-    """Получение статьи по ID"""
+    """Получение статьи по ID с изображениями"""
     article = await fetch_row(
-        "SELECT id, title, content FROM articles WHERE id = $1",
+        """
+        SELECT 
+            a.id,
+            a.author, 
+            a.title, 
+            a.content,
+            COALESCE(
+                (SELECT json_agg(json_build_object('id', ai.id, 'path', ai.image_path))
+                FROM article_images ai
+                WHERE ai.article_id = a.id
+                ),
+                '[]'::json
+            ) AS images
+        FROM articles a
+        WHERE a.id = $1
+        """,
         article_id,
     )
     
     if not article:
         raise HTTPException(status_code=404, detail="Статья не найдена")
 
-    return {
-        "id": article["id"],
-        "title": article["title"],
-        "content": article["content"],
-    }
+    return dict(article)
+
+@app.get("/api/articles/by-author/{author}")
+@limiter.limit("30 per minute")
+async def get_articles_by_author(
+    request: Request,
+    author: str = Path(..., min_length=1, max_length=50),
+    skip: int = 0,
+    limit: int = 10,
+):
+    """Получение статей по автору"""
+    try:
+        results = await fetch_all(
+            """
+            SELECT 
+                a.id, 
+                a.author,
+                a.title, 
+                a.content,
+                COALESCE(
+                    (SELECT json_agg(json_build_object('id', ai.id, 'path', ai.image_path))
+                    FROM article_images ai
+                    WHERE ai.article_id = a.id
+                    ),
+                    '[]'::json
+                ) AS images
+            FROM articles a
+            WHERE a.author = $1
+            ORDER BY a.created_at DESC
+            OFFSET $2 LIMIT $3
+            """,
+            author,
+            skip,
+            limit,
+        )
+        return [dict(record) for record in results]
+    except Exception as e:
+        logger.error(f"Ошибка получения статей автора {author}: {e}")
+        raise HTTPException(status_code=500, detail="Ошибка выполнения запроса")
 
 @app.post("/api/addarticle")
 @limiter.limit("10 per minute")
-async def addarticle(request: Request, article: WriteArticle):
-    """Добавление новой статьи"""
+async def addarticle(
+    request: Request,
+    author: str = Form(...),
+    title: str = Form(...),
+    content: str = Form(...),
+    images: list[UploadFile] = File([]),
+):
+    """Добавление новой статьи с изображениями"""
+    
+    # Логирование входящих данных
+    logger.info(f"Received addarticle request")
+    logger.info(f"Author: {author}")
+    logger.info(f"Title: {title}")
+    logger.info(f"Content length: {len(content)}")
+    logger.info(f"Images count: {len(images)}")
+    
+    # Логирование файлов
+    for i, image in enumerate(images):
+        logger.info(f"Image {i+1}: {image.filename}, size: {image.size}, type: {image.content_type}")
+    
     # Проверка аутентификации
     access_token = request.cookies.get("access_token")
     if not access_token:
@@ -673,15 +802,72 @@ async def addarticle(request: Request, article: WriteArticle):
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Недействительный токен")
 
-    # Добавление статьи
-    await execute_query(
-        "INSERT INTO articles (author, title, content) VALUES ($1, $2, $3)",
-        article.author,
-        article.title,
-        article.content,
-    )
+    errors = []
+    saved_files = []
+    conn = await get_db_connection()
     
-    return {"success": True, "message": "Статья успешно добавлена"}
+    try:
+        async with conn.transaction():
+            # Сохраняем статью
+            article_id = await conn.fetchval(
+                "INSERT INTO articles (author, title, content) VALUES ($1, $2, $3) RETURNING id",
+                author,
+                title,
+                content,
+            )
+
+            # Обрабатываем изображения
+            for image in images:
+                # Проверка типа изображения
+                if image.content_type not in ALLOWED_IMAGE_TYPES:
+                    errors.append(f"Недопустимый тип файла: {image.filename}")
+                    continue
+                
+                # Проверка размера (максимум 10 МБ)
+                if image.size > 10 * 1024 * 1024:
+                    errors.append(f"Файл слишком большой: {image.filename}")
+                    continue
+                
+                # Генерация уникального имени файла
+                file_ext = os.path.splitext(image.filename)[1]
+                file_name = f"{uuid.uuid4().hex}{file_ext}"
+                file_path = os.path.join(UPLOAD_DIR, file_name)
+                
+                # Сохранение файла
+                try:
+                    contents = await image.read()
+                    with open(file_path, "wb") as f:
+                        f.write(contents)
+                    saved_files.append(file_path)
+                except Exception as e:
+                    errors.append(f"Ошибка сохранения файла: {image.filename}")
+                    continue
+                
+                # Сохранение информации о файле в БД
+                await conn.execute(
+                    "INSERT INTO article_images (article_id, image_path) VALUES ($1, $2)",
+                    article_id,
+                    file_name,
+                )
+                
+    except Exception as e:
+        # Удаляем сохраненные файлы при ошибке
+        for file_path in saved_files:
+            try:
+                os.remove(file_path)
+            except:
+                pass
+        raise HTTPException(status_code=500, detail=f"Ошибка сервера: {str(e)}")
+    
+    finally:
+        await db_pool.release(conn)
+
+    # Формируем ответ
+    response = {"success": True, "message": "Статья успешно добавлена"}
+    if errors:
+        response["warnings"] = errors
+        
+    return response
 
 @app.post("/api/comments")
 @limiter.limit("20 per minute")
@@ -811,4 +997,3 @@ if __name__ == "__main__":
     
     logger.info(f"Запуск сервера с конфигурацией: {uvicorn_config}")
     uvicorn.run(**uvicorn_config)
-#uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4 --timeout-keep-alive 30 --backlog 1000 - команда для запуска

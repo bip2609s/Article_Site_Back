@@ -592,31 +592,33 @@ async def refresh_token(request: Request, response: Response):
 @app.get("/api/me")
 @limiter.limit("20 per minute")
 async def get_current_user(request: Request):
-    """Получение информации о текущем пользователе"""
+    """Получение информации о текущем пользователе и количестве его статей"""
     access_token = request.cookies.get("access_token")
     if not access_token:
         return {"message": False}
-
     try:
         payload = jwt.decode(access_token, SECRET_KEY, algorithms=[ALGORITHM])
         email = payload.get("sub")
         if not email:
             return {"message": False}
-        
+        # Получение данных пользователя
         user = await fetch_row(
             "SELECT id, username, email FROM users WHERE email = $1", 
             email
         )
-        
         if not user:
             return {"message": False}
-
+        # Получение количества статей пользователя
+        article_count = await fetch_value(
+            "SELECT COUNT(*) FROM articles WHERE author = $1",
+            user["username"]
+        )
         return {
             "message": True,
             "username": user["username"],
             "email": user["email"],
+            "article_count": article_count
         }
-
     except jwt.PyJWTError:
         return {"message": False}
 
@@ -731,6 +733,61 @@ async def get_article(request: Request, article_id: int = Path(..., gt=0)):
         raise HTTPException(status_code=404, detail="Статья не найдена")
 
     return dict(article)
+
+@app.delete("/api/articles/{article_id}")
+@limiter.limit("10 per minute")
+async def delete_article(
+    request: Request,
+    article_id: int = Path(..., gt=0),
+):
+    """Удаление статьи"""
+    # Проверка аутентификации
+    access_token = request.cookies.get("access_token")
+    if not access_token:
+        raise HTTPException(status_code=401, detail="Требуется авторизация")
+    
+    try:
+        payload = jwt.decode(access_token, SECRET_KEY, algorithms=[ALGORITHM])
+        email = payload.get("sub")
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Недействительный токен")
+
+    # Получение пользователя
+    user = await fetch_row("SELECT username FROM users WHERE email = $1", email)
+    if not user:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+
+    # Получение статьи
+    article = await fetch_row(
+        "SELECT author FROM articles WHERE id = $1", 
+        article_id
+    )
+    if not article:
+        raise HTTPException(status_code=404, detail="Статья не найдена")
+    
+    # Проверка прав доступа
+    if article["author"] != user["username"]:
+        raise HTTPException(status_code=403, detail="Нет прав для удаления")
+
+    # Удаление связанных изображений
+    images = await fetch_all(
+        "SELECT image_path FROM article_images WHERE article_id = $1",
+        article_id
+    )
+    
+    # Удаление статьи (каскадное удаление комментариев и изображений из БД)
+    await execute_query("DELETE FROM articles WHERE id = $1", article_id)
+    
+    # Физическое удаление файлов изображений
+    for image in images:
+        file_path = os.path.join(UPLOAD_DIR, image["image_path"])
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+        except Exception as e:
+            logger.error(f"Ошибка удаления файла {file_path}: {e}")
+
+    return {"success": True, "message": "Статья удалена"}
 
 @app.get("/api/articles/by-author/{author}")
 @limiter.limit("30 per minute")
